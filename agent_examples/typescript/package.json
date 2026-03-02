@@ -1,0 +1,23 @@
+{
+  "name": "agent-examples-typescript",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "devops-agent": "tsx devops-agent.ts"
+  },
+  "dependencies": {
+    "@langchain/community": "^1.1.20",
+    "@langchain/core": "^1.1.29",
+    "@langchain/ollama": "^1.2.5",
+    "dotenv": "^16.4.0",
+    "llpsdk": "^0.2.0",
+    "pdf-parse": "^2.4.5",
+    "pdfjs-dist": "^5.5.207"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.5.0"
+  }
+}
