@@ -14,7 +14,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 config({ path: join(__dirname, '.env') });
 
-import { LLPClient, TextMessage, LLPClientConfig } from 'llpsdk';
+import {
+	LLPClient,
+	TextMessage,
+	LLPClientConfig,
+	PlatformTraceHandler,
+} from 'llpsdk';
 import { ChatOllama } from '@langchain/ollama';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
@@ -155,7 +160,12 @@ function formatAnalysis(analysis: FinancialAnalysis): string {
 // Message Handler (mirrors Python/Go handleMessage pattern)
 // =============================================================================
 
-export async function handleMessage(llm: ChatOllama, message: TextMessage): Promise<string> {
+export async function handleMessage(
+	llm: ChatOllama,
+	message: TextMessage,
+	traceHandler?: PlatformTraceHandler,
+	client?: LLPClient,
+): Promise<string> {
 	// Use message ID as correlation ID for tracing request/response pairs
 	const corrId = message.id?.slice(0, 8) ?? 'no-id';
 	const preview = message.prompt.slice(0, 80);
@@ -165,6 +175,7 @@ export async function handleMessage(llm: ChatOllama, message: TextMessage): Prom
 	// Fetch PDF attachment via WebPDFLoader
 	let attachmentContent = '';
 	if (message.hasAttachment()) {
+		const start = Date.now();
 		try {
 			console.log(`[${corrId}] ... fetching attachment url=${message.attachment}`);
 			const response = await fetch(message.attachment);
@@ -182,6 +193,15 @@ export async function handleMessage(llm: ChatOllama, message: TextMessage): Prom
 			}
 		} catch (err) {
 			console.error(`[${corrId}] !!! ATTACHMENT FETCH ERROR error=${err}`);
+		} finally {
+			if (client?.traceHandler) {
+				await client.sendTrace({
+					prompt: 'attachment_fetched',
+					stepType: 'io',
+					decisionId: corrId,
+					latencyMs: Date.now() - start,
+				});
+			}
 		}
 	}
 
@@ -194,11 +214,16 @@ export async function handleMessage(llm: ChatOllama, message: TextMessage): Prom
 	let analysis: FinancialAnalysis;
 	try {
 		console.log(`[${corrId}] ... calling LLM`);
-		const chain = llm.pipe(outputParser);
-		analysis = await chain.invoke([
-			new SystemMessage(SYSTEM_PROMPT),
-			new HumanMessage(fullPrompt),
-		]);
+		const chain = llm.withConfig(
+			traceHandler ? { callbacks: [traceHandler] } : {},
+		).pipe(outputParser);
+		analysis = await chain.invoke(
+			[
+				new SystemMessage(SYSTEM_PROMPT),
+				new HumanMessage(fullPrompt),
+			],
+			traceHandler ? { callbacks: [traceHandler] } : {},
+		);
 		console.log(`[${corrId}] === type=${analysis.type} category=${analysis.category ?? 'n/a'}`);
 	} catch (err) {
 		console.error(`[${corrId}] !!! LLM CALL FAILED error=${err}`);
@@ -237,17 +262,18 @@ async function main(): Promise<void> {
 	});
 	console.log(`LangChain ChatOllama initialized model=${model}`);
 
-	// 3. Initialize LLP client
-	const llpConfig: LLPClientConfig = {
-		url: process.env.PLATFORM_ADDRESS ?? 'ws://localhost:4000/agent/websocket',
-		responseTimeout: 600000, // 10 minutes
-	};
-	const client = new LLPClient(agentName, apiKey, llpConfig);
+// 3. Initialize LLP client (with tracing enabled)
+const llpConfig: LLPClientConfig = {
+	url: process.env.PLATFORM_ADDRESS ?? 'ws://localhost:4000/agent/websocket',
+	responseTimeout: 600000, // 10 minutes
+};
+const client = new LLPClient(agentName, apiKey, { ...llpConfig, tracing: true });
+const traceHandler = client.traceHandler;
 
 	client.onMessage(async (msg: TextMessage) => {
 		const corrId = msg.id?.slice(0, 8) ?? 'no-id';
 		console.log(`[${corrId}] --- REQUEST START ---`);
-		const response = await handleMessage(llm, msg);
+		const response = await handleMessage(llm, msg, traceHandler, client);
 		console.log(`[${corrId}] <<< SEND to=${msg.sender} len=${response.length}`);
 		console.log(`[${corrId}] --- REQUEST END ---`);
 		return msg.reply(response);
