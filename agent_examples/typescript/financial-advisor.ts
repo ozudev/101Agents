@@ -18,8 +18,9 @@ import {
 	LLPClient,
 	TextMessage,
 	LLPClientConfig,
-	PlatformTraceHandler,
+	type Annotater,
 } from 'llpsdk';
+import { LLPToolCallMiddleware } from 'llpsdk/langchain';
 import { ChatOllama } from '@langchain/ollama';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
@@ -162,9 +163,8 @@ function formatAnalysis(analysis: FinancialAnalysis): string {
 
 export async function handleMessage(
 	llm: ChatOllama,
+	annotater: Annotater,
 	message: TextMessage,
-	traceHandler?: PlatformTraceHandler,
-	client?: LLPClient,
 ): Promise<string> {
 	// Use message ID as correlation ID for tracing request/response pairs
 	const corrId = message.id?.slice(0, 8) ?? 'no-id';
@@ -175,7 +175,6 @@ export async function handleMessage(
 	// Fetch PDF attachment via WebPDFLoader
 	let attachmentContent = '';
 	if (message.hasAttachment()) {
-		const start = Date.now();
 		try {
 			console.log(`[${corrId}] ... fetching attachment url=${message.attachment}`);
 			const response = await fetch(message.attachment);
@@ -193,15 +192,6 @@ export async function handleMessage(
 			}
 		} catch (err) {
 			console.error(`[${corrId}] !!! ATTACHMENT FETCH ERROR error=${err}`);
-		} finally {
-			if (client?.traceHandler) {
-				await client.sendTrace({
-					prompt: 'attachment_fetched',
-					stepType: 'io',
-					decisionId: corrId,
-					latencyMs: Date.now() - start,
-				});
-			}
 		}
 	}
 
@@ -211,18 +201,15 @@ export async function handleMessage(
 		: message.prompt;
 
 	// Call LLM via LangChain chain: messages → ChatOllama → JsonOutputParser
+	// LLPToolCallMiddleware intercepts any tool calls and annotates them back to the platform.
 	let analysis: FinancialAnalysis;
 	try {
 		console.log(`[${corrId}] ... calling LLM`);
-		const chain = llm.withConfig(
-			traceHandler ? { callbacks: [traceHandler] } : {},
-		).pipe(outputParser);
+		const toolMiddleware = new LLPToolCallMiddleware(message, annotater);
+		const chain = llm.pipe(outputParser);
 		analysis = await chain.invoke(
-			[
-				new SystemMessage(SYSTEM_PROMPT),
-				new HumanMessage(fullPrompt),
-			],
-			traceHandler ? { callbacks: [traceHandler] } : {},
+			[new SystemMessage(SYSTEM_PROMPT), new HumanMessage(fullPrompt)],
+			{ callbacks: [toolMiddleware] },
 		);
 		console.log(`[${corrId}] === type=${analysis.type} category=${analysis.category ?? 'n/a'}`);
 	} catch (err) {
@@ -262,18 +249,17 @@ async function main(): Promise<void> {
 	});
 	console.log(`LangChain ChatOllama initialized model=${model}`);
 
-// 3. Initialize LLP client (with tracing enabled)
-const llpConfig: LLPClientConfig = {
-	url: process.env.PLATFORM_ADDRESS ?? 'ws://localhost:4000/agent/websocket',
-	responseTimeout: 600000, // 10 minutes
-};
-const client = new LLPClient(agentName, apiKey, { ...llpConfig, tracing: true });
-const traceHandler = client.traceHandler;
+	// 3. Initialize LLP client
+	const llpConfig: LLPClientConfig = {
+		url: process.env.PLATFORM_ADDRESS ?? 'ws://localhost:4000/agent/websocket',
+		responseTimeout: 600000, // 10 minutes
+	};
+	const client = new LLPClient(agentName, apiKey, llpConfig);
 
-	client.onMessage(async (msg: TextMessage) => {
+	client.onMessage(async (annotater, msg: TextMessage) => {
 		const corrId = msg.id?.slice(0, 8) ?? 'no-id';
 		console.log(`[${corrId}] --- REQUEST START ---`);
-		const response = await handleMessage(llm, msg, traceHandler, client);
+		const response = await handleMessage(llm, annotater, msg);
 		console.log(`[${corrId}] <<< SEND to=${msg.sender} len=${response.length}`);
 		console.log(`[${corrId}] --- REQUEST END ---`);
 		return msg.reply(response);
