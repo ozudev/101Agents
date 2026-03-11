@@ -6,7 +6,7 @@
  */
 
 import { config } from 'dotenv';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { dirname, join } from 'path';
 
 // Load .env from the same directory as this script
@@ -20,11 +20,12 @@ import {
 	LLPClientConfig,
 	type Annotater,
 } from 'llpsdk';
-import { LLPToolCallMiddleware } from 'llpsdk/langchain';
 import { ChatOllama } from '@langchain/ollama';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { WebPDFLoader } from '@langchain/community/document_loaders/web/pdf';
+import { createAgent, createMiddleware, tool } from 'langchain';
+import * as z from 'zod';
 
 // =============================================================================
 // Constants
@@ -89,20 +90,164 @@ Return JSON matching ONE of these formats:
 // Types (mirrors Python dataclasses / Go structs)
 // =============================================================================
 
-interface FinancialAnalysis {
-	type: 'analysis' | 'capabilities' | 'decline' | string;
-	category?: 'investment' | 'budgeting' | 'retirement' | 'tax' | 'debt' | 'savings';
-	risk_level?: 'low' | 'medium' | 'high';
-	recommendation?: string;
-	considerations?: string[];
-	reason?: string; // For decline responses
-}
+const financialAnalysisSchema = z.object({
+	type: z.union([z.literal('analysis'), z.literal('capabilities'), z.literal('decline'), z.string()]),
+	category: z.enum(['investment', 'budgeting', 'retirement', 'tax', 'debt', 'savings', 'invoices']).optional(),
+	risk_level: z.enum(['low', 'medium', 'high']).optional(),
+	recommendation: z.string().optional(),
+	considerations: z.array(z.string()).optional(),
+	reason: z.string().optional(),
+});
+
+type FinancialAnalysis = z.infer<typeof financialAnalysisSchema>;
 
 // =============================================================================
 // LangChain setup
 // =============================================================================
 
 const outputParser = new JsonOutputParser<FinancialAnalysis>();
+const middlewareStateSchema = z.object({
+	modelCallCount: z.number().default(0),
+});
+const middlewareContextSchema = z.object({
+	annotater: z.custom<Annotater>(),
+	message: z.custom<TextMessage>(),
+	correlationId: z.string(),
+});
+
+interface MiddlewareRuntimeContext {
+	annotater: Annotater;
+	message: TextMessage;
+	correlationId: string;
+}
+
+interface ToolCallRequest {
+	toolCall: {
+		name: string;
+		args: unknown;
+	};
+	runtime: {
+		context: MiddlewareRuntimeContext;
+	};
+}
+
+async function loadPdfText(url: string): Promise<string> {
+	const response = await fetch(url);
+	if (!response.ok) {
+		throw new Error(`Attachment fetch failed with status ${response.status}`);
+	}
+
+	const blob = await response.blob();
+	const loader = new WebPDFLoader(blob, {
+		splitPages: false,
+		pdfjs: () => import('pdfjs-dist/legacy/build/pdf.mjs') as never,
+	});
+	const docs = await loader.load();
+	return docs.map(d => d.pageContent).join('\n');
+}
+
+const loadInvoicePdfTool = tool(
+	async ({ url }: { url: string }) => {
+		const content = await loadPdfText(url);
+		return content;
+	},
+	{
+		name: 'load_invoice_pdf',
+		description:
+			'Load and extract text from a PDF invoice attachment when the user asks about invoice contents or an attached PDF.',
+		schema: z.object({
+			url: z.string().url().describe('The attachment URL for the PDF to inspect'),
+		}),
+	},
+);
+
+const llpAnnotationMiddleware = createMiddleware({
+	name: 'LLPToolAnnotationMiddleware',
+	stateSchema: middlewareStateSchema,
+	contextSchema: middlewareContextSchema,
+	afterModel: (state: { modelCallCount: number }) => ({
+		modelCallCount: state.modelCallCount + 1,
+	}),
+	wrapToolCall: async (
+		request: ToolCallRequest,
+		handler: (request: ToolCallRequest) => Promise<unknown>,
+	) => {
+		const startMs = Date.now();
+		const { message, annotater, correlationId } = request.runtime.context;
+		const toolName = request.toolCall.name;
+		const parameters = JSON.stringify(request.toolCall.args);
+		console.log(`[${correlationId}] ... tool=${toolName} args=${parameters}`);
+
+		try {
+			const result = await handler(request);
+			const durationMs = Date.now() - startMs;
+			await annotater.annotateToolCall(
+				message.toolCall(toolName, parameters, JSON.stringify(result), durationMs),
+			);
+			console.log(`[${correlationId}] <<< tool=${toolName} durationMs=${durationMs}`);
+			return result;
+		} catch (error) {
+			const durationMs = Date.now() - startMs;
+			const err = error instanceof Error ? error : new Error(String(error));
+			await annotater.annotateToolCall(
+				message.toolCallException(toolName, parameters, err, durationMs),
+			);
+			console.warn(`[${correlationId}] !!! tool=${toolName} durationMs=${durationMs} error=${err.message}`);
+			throw error;
+		}
+	},
+});
+
+function extractTextContent(content: unknown): string {
+	if (typeof content === 'string') {
+		return content;
+	}
+
+	if (Array.isArray(content)) {
+		return content
+			.map(item => {
+				if (typeof item === 'string') {
+					return item;
+				}
+				if (item && typeof item === 'object' && 'text' in item) {
+					return String((item as { text?: unknown }).text ?? '');
+				}
+				return '';
+			})
+			.filter(Boolean)
+			.join('\n');
+	}
+
+	return String(content ?? '');
+}
+
+function buildPrompt(message: TextMessage): string {
+	const attachmentUrl = message.attachment;
+	if (!message.hasAttachment() || !attachmentUrl) {
+		return `${message.prompt}
+
+Return ONLY valid JSON matching the required schema.`;
+	}
+
+	return `${message.prompt}
+
+An attachment is available at this URL: ${attachmentUrl}
+If the user is asking about the attachment or an invoice, use the load_invoice_pdf tool with that URL before answering.
+Return ONLY valid JSON matching the required schema.`;
+}
+
+async function parseAnalysisResponse(rawText: string): Promise<FinancialAnalysis> {
+	const parsed = await outputParser.invoke(rawText);
+	return financialAnalysisSchema.parse(parsed);
+}
+
+export function createFinancialAdvisorAgent(llm: ChatOllama) {
+	return createAgent({
+		model: llm,
+		tools: [loadInvoicePdfTool],
+		middleware: [llpAnnotationMiddleware],
+	});
+}
 
 // =============================================================================
 // Helper Functions
@@ -162,7 +307,7 @@ function formatAnalysis(analysis: FinancialAnalysis): string {
 // =============================================================================
 
 export async function handleMessage(
-	llm: ChatOllama,
+	agent: ReturnType<typeof createFinancialAdvisorAgent>,
 	annotater: Annotater,
 	message: TextMessage,
 ): Promise<string> {
@@ -172,45 +317,27 @@ export async function handleMessage(
 	console.log(`[${corrId}] >>> RECV from=${message.sender} prompt="${preview}"`);
 	console.log(message);
 
-	// Fetch PDF attachment via WebPDFLoader
-	let attachmentContent = '';
-	if (message.hasAttachment()) {
-		try {
-			console.log(`[${corrId}] ... fetching attachment url=${message.attachment}`);
-			const response = await fetch(message.attachment);
-			if (!response.ok) {
-				console.warn(`[${corrId}] !!! ATTACHMENT FETCH FAILED status=${response.status}`);
-			} else {
-				const blob = await response.blob();
-				const loader = new WebPDFLoader(blob, {
-					splitPages: false,
-					pdfjs: () => import('pdfjs-dist/legacy/build/pdf.mjs') as never,
-				});
-				const docs = await loader.load();
-				attachmentContent = docs.map(d => d.pageContent).join('\n');
-				console.log(`[${corrId}] <<< attachment parsed pages=${docs.length} len=${attachmentContent.length}`);
-			}
-		} catch (err) {
-			console.error(`[${corrId}] !!! ATTACHMENT FETCH ERROR error=${err}`);
-		}
-	}
+	const fullPrompt = buildPrompt(message);
 
-	// Build prompt with attachment content if available
-	const fullPrompt = attachmentContent
-		? `${message.prompt}\n\nAttachment content type: application/pdf\nAttachment content:\n${attachmentContent}`
-		: message.prompt;
-
-	// Call LLM via LangChain chain: messages → ChatOllama → JsonOutputParser
-	// LLPToolCallMiddleware intercepts any tool calls and annotates them back to the platform.
 	let analysis: FinancialAnalysis;
 	try {
-		console.log(`[${corrId}] ... calling LLM`);
-		const toolMiddleware = new LLPToolCallMiddleware(message, annotater);
-		const chain = llm.pipe(outputParser);
-		analysis = await chain.invoke(
-			[new SystemMessage(SYSTEM_PROMPT), new HumanMessage(fullPrompt)],
-			{ callbacks: [toolMiddleware] },
+		console.log(`[${corrId}] ... calling agent`);
+		const result = await agent.invoke(
+			{
+				messages: [new SystemMessage(SYSTEM_PROMPT), new HumanMessage(fullPrompt)],
+				modelCallCount: 0,
+			},
+			{
+				context: {
+					annotater,
+					message,
+					correlationId: corrId,
+				},
+			},
 		);
+		const lastMessage = result.messages[result.messages.length - 1];
+		const rawText = extractTextContent(lastMessage?.content);
+		analysis = await parseAnalysisResponse(rawText);
 		console.log(`[${corrId}] === type=${analysis.type} category=${analysis.category ?? 'n/a'}`);
 	} catch (err) {
 		console.error(`[${corrId}] !!! LLM CALL FAILED error=${err}`);
@@ -247,6 +374,7 @@ async function main(): Promise<void> {
 			? { Authorization: `Bearer ${process.env.OLLAMA_API_KEY}` }
 			: undefined,
 	});
+	const agent = createFinancialAdvisorAgent(llm);
 	console.log(`LangChain ChatOllama initialized model=${model}`);
 
 	// 3. Initialize LLP client
@@ -259,7 +387,7 @@ async function main(): Promise<void> {
 	client.onMessage(async (annotater, msg: TextMessage) => {
 		const corrId = msg.id?.slice(0, 8) ?? 'no-id';
 		console.log(`[${corrId}] --- REQUEST START ---`);
-		const response = await handleMessage(llm, annotater, msg);
+		const response = await handleMessage(agent, annotater, msg);
 		console.log(`[${corrId}] <<< SEND to=${msg.sender} len=${response.length}`);
 		console.log(`[${corrId}] --- REQUEST END ---`);
 		return msg.reply(response);
@@ -289,4 +417,9 @@ async function main(): Promise<void> {
 	}
 }
 
-main();
+const isMainModule =
+	process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMainModule) {
+	void main();
+}

@@ -21,7 +21,7 @@ config({ path: join(__dirname, '.env') });
 
 import { ChatOllama } from '@langchain/ollama';
 import type { Annotater } from 'llpsdk';
-import { handleMessage } from './financial-advisor.js';
+import { createFinancialAdvisorAgent, handleMessage } from './financial-advisor.js';
 
 // =============================================================================
 // Minimal TextMessage stub — mirrors the llpsdk TextMessage interface
@@ -68,6 +68,7 @@ async function main(): Promise<void> {
 			? { Authorization: `Bearer ${process.env.OLLAMA_API_KEY}` }
 			: undefined,
 	});
+	const agent = createFinancialAdvisorAgent(llm);
 
 	console.log(`Ollama: ${process.env.OLLAMA_HOST} / model: ${process.env.OLLAMA_MODEL}`);
 	console.log(`PDF URL: ${pdfUrl ?? '(none — skipping PDF test)'}`);
@@ -75,7 +76,7 @@ async function main(): Promise<void> {
 	// --- Test 1: capabilities question ---
 	await runTest('Capabilities question (no PDF)', async () => {
 		const msg = makeMessage('What can you help me with?');
-		const result = await handleMessage(llm, noopAnnotater, msg);
+		const result = await handleMessage(agent, noopAnnotater, msg);
 		console.log('\nResponse:\n', result);
 		if (!result.includes('Investment')) throw new Error('Expected capabilities response');
 	});
@@ -83,7 +84,7 @@ async function main(): Promise<void> {
 	// --- Test 2: financial analysis question ---
 	await runTest('Financial analysis question (no PDF)', async () => {
 		const msg = makeMessage('I have $10,000 saved. Should I pay off my credit card debt at 20% APR or invest in an index fund?');
-		const result = await handleMessage(llm, noopAnnotater, msg);
+		const result = await handleMessage(agent, noopAnnotater, msg);
 		console.log('\nResponse:\n', result);
 		if (!result.includes('Category') && !result.includes('Risk Level')) {
 			throw new Error('Expected analysis response with Category/Risk Level');
@@ -93,7 +94,7 @@ async function main(): Promise<void> {
 	// --- Test 3: out-of-domain question ---
 	await runTest('Out-of-domain question (decline)', async () => {
 		const msg = makeMessage('What is the capital of France?');
-		const result = await handleMessage(llm, noopAnnotater, msg);
+		const result = await handleMessage(agent, noopAnnotater, msg);
 		console.log('\nResponse:\n', result);
 	});
 
@@ -101,8 +102,7 @@ async function main(): Promise<void> {
 	if (pdfUrl) {
 		await runTest(`PDF invoice parsing — ${pdfUrl}`, async () => {
 			const msg = makeMessage('Please summarize the details of this invoice.', pdfUrl);
-			// Note: WebPDFLoader is exercised inside handleMessage
-			const result = await handleMessage(llm, noopAnnotater, msg);
+			const result = await handleMessage(agent, noopAnnotater, msg);
 			console.log('\nResponse:\n', result);
 			if (!result || result.length < 10) throw new Error('Expected non-empty response for PDF');
 		});
