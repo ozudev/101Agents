@@ -14,8 +14,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 config({ path: join(__dirname, '.env') });
 
-import { LLPClient, TextMessage, type LLPClientConfig } from 'llpsdk';
-import { LLPAnnotationMiddleware } from 'llpsdk/langchain';
+import { LLPClient, TextMessage, type LLPClientConfig, type Annotater } from 'llpsdk';
+import { createLLPToolMiddleware } from 'llpsdk/langchain';
 import { ChatOllama } from '@langchain/ollama';
 import { HumanMessage } from '@langchain/core/messages';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
@@ -180,7 +180,7 @@ export function createFinancialAdvisorAgent(llm: ChatOllama) {
 	return createAgent({
 		model: llm,
 		tools: [loadInvoicePdfTool],
-		middleware: [LLPAnnotationMiddleware],
+		middleware: [createLLPToolMiddleware()],
 		systemPrompt: SYSTEM_PROMPT,
 	});
 }
@@ -247,6 +247,7 @@ function formatAnalysis(analysis: FinancialAnalysis): string {
 export async function handleMessage(
 	agent: FinancialAdvisorAgent,
 	message: TextMessage,
+	annotater: Annotater,
 ): Promise<string> {
 	const corrId = message.id?.slice(0, 8) ?? 'no-id';
 	const preview = message.prompt.slice(0, 80);
@@ -257,9 +258,10 @@ export async function handleMessage(
 	let analysis: FinancialAnalysis;
 	try {
 		console.log(`[${corrId}] ... calling agent`);
-		const result = await agent.invoke({
-			messages: [new HumanMessage(fullPrompt)],
-		});
+		const result = await agent.invoke(
+			{ messages: [new HumanMessage(fullPrompt)] },
+			{ context: { llpMessage: message, llpClient: annotater } },
+		);
 		const lastMessage = result.messages[result.messages.length - 1];
 		const rawText = extractTextContent(lastMessage?.content);
 		analysis = await parseAnalysisResponse(rawText);
@@ -305,8 +307,8 @@ async function main(): Promise<void> {
 
 	const client = new LLPClient(agentName, apiKey, llpConfig)
 		.onStart(() => createFinancialAdvisorAgent(llm))
-		.onMessage(async (agent, msg) => {
-			const response = await handleMessage(agent, msg);
+		.onMessage(async (agent, msg, annotater) => {
+			const response = await handleMessage(agent, msg, annotater);
 			return msg.reply(response);
 		})
 		.onStop(() => {
