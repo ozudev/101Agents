@@ -14,15 +14,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 config({ path: join(__dirname, '.env') });
 
-import {
-	LLPClient,
-	TextMessage,
-	LLPClientConfig,
-	type Annotater,
-} from 'llpsdk';
-import { createLLPToolMiddleware } from 'llpsdk/langchain';
+import { LLPClient, TextMessage, type LLPClientConfig } from 'llpsdk';
+import { LLPAnnotationMiddleware } from 'llpsdk/langchain';
 import { ChatOllama } from '@langchain/ollama';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import { HumanMessage } from '@langchain/core/messages';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { WebPDFLoader } from '@langchain/community/document_loaders/web/pdf';
 import { createAgent, tool } from 'langchain';
@@ -138,8 +133,6 @@ const loadInvoicePdfTool = tool(
 	},
 );
 
-type AgentMiddleware = ReturnType<typeof createLLPToolMiddleware>;
-
 function extractTextContent(content: unknown): string {
 	if (typeof content === 'string') {
 		return content;
@@ -183,16 +176,16 @@ async function parseAnalysisResponse(rawText: string): Promise<FinancialAnalysis
 	return financialAnalysisSchema.parse(parsed);
 }
 
-export function createFinancialAdvisorAgent(
-	llm: ChatOllama,
-	middleware: AgentMiddleware[] = [],
-) {
+export function createFinancialAdvisorAgent(llm: ChatOllama) {
 	return createAgent({
 		model: llm,
 		tools: [loadInvoicePdfTool],
-		middleware,
+		middleware: [LLPAnnotationMiddleware],
+		systemPrompt: SYSTEM_PROMPT,
 	});
 }
+
+export type FinancialAdvisorAgent = ReturnType<typeof createFinancialAdvisorAgent>;
 
 // =============================================================================
 // Helper Functions
@@ -252,25 +245,20 @@ function formatAnalysis(analysis: FinancialAnalysis): string {
 // =============================================================================
 
 export async function handleMessage(
-	llm: ChatOllama,
-	annotater: Annotater,
+	agent: FinancialAdvisorAgent,
 	message: TextMessage,
 ): Promise<string> {
-	// Use message ID as correlation ID for tracing request/response pairs
 	const corrId = message.id?.slice(0, 8) ?? 'no-id';
 	const preview = message.prompt.slice(0, 80);
 	console.log(`[${corrId}] >>> RECV from=${message.sender} prompt="${preview}"`);
-	console.log(message);
 
 	const fullPrompt = buildPrompt(message);
 
 	let analysis: FinancialAnalysis;
 	try {
-		const agent = createFinancialAdvisorAgent(llm, [createLLPToolMiddleware(message, annotater)]);
-
 		console.log(`[${corrId}] ... calling agent`);
 		const result = await agent.invoke({
-			messages: [new SystemMessage(SYSTEM_PROMPT), new HumanMessage(fullPrompt)],
+			messages: [new HumanMessage(fullPrompt)],
 		});
 		const lastMessage = result.messages[result.messages.length - 1];
 		const rawText = extractTextContent(lastMessage?.content);
@@ -281,7 +269,6 @@ export async function handleMessage(
 		return "I'm sorry, I encountered an error processing your request.";
 	}
 
-	// Route based on response type
 	if (analysis.type === 'capabilities') {
 		return formatCapabilities();
 	} else if (analysis.type === 'decline') {
@@ -298,11 +285,9 @@ export async function handleMessage(
 // =============================================================================
 
 async function main(): Promise<void> {
-	// 1. Load environment variables
 	const agentName = process.env.AGENT_NAME ?? 'financial-advisor-ts';
 	const apiKey = process.env.AGENT_KEY ?? 'Z22MAsvpGFrMMX9qLZZqIynKp/42gBa4Edl/X94MFkA';
 
-	// 2. Initialize LangChain ChatOllama client
 	const model = process.env.OLLAMA_MODEL ?? 'gpt-oss:120b';
 	const llm = new ChatOllama({
 		baseUrl: process.env.OLLAMA_HOST ?? 'http://localhost:11434',
@@ -313,23 +298,21 @@ async function main(): Promise<void> {
 	});
 	console.log(`LangChain ChatOllama initialized model=${model}`);
 
-	// 3. Initialize LLP client
 	const llpConfig: LLPClientConfig = {
 		url: process.env.PLATFORM_ADDRESS ?? 'ws://localhost:4000/agent/websocket',
-		responseTimeout: 600000, // 10 minutes
+		responseTimeout: 600000,
 	};
-	const client = new LLPClient(agentName, apiKey, llpConfig);
 
-	client.onMessage(async (annotater, msg: TextMessage) => {
-		const corrId = msg.id?.slice(0, 8) ?? 'no-id';
-		console.log(`[${corrId}] --- REQUEST START ---`);
-		const response = await handleMessage(llm, annotater, msg);
-		console.log(`[${corrId}] <<< SEND to=${msg.sender} len=${response.length}`);
-		console.log(`[${corrId}] --- REQUEST END ---`);
-		return msg.reply(response);
-	});
+	const client = new LLPClient(agentName, apiKey, llpConfig)
+		.onStart(() => createFinancialAdvisorAgent(llm))
+		.onMessage(async (agent, msg) => {
+			const response = await handleMessage(agent, msg);
+			return msg.reply(response);
+		})
+		.onStop(() => {
+			console.log('session ended');
+		});
 
-	// 5. Setup graceful shutdown
 	const shutdown = async () => {
 		console.log('\nShutting down...');
 		await client.close();
@@ -340,12 +323,9 @@ async function main(): Promise<void> {
 	process.on('SIGINT', shutdown);
 	process.on('SIGTERM', shutdown);
 
-	// 6. Connect and run
 	try {
 		await client.connect();
 		console.log('Connected to platform');
-
-		// Wait forever
 		await new Promise(() => {});
 	} catch (err) {
 		console.error('Fatal error:', err);
