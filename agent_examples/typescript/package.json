@@ -12,7 +12,7 @@
     "@langchain/ollama": "^1.2.5",
     "dotenv": "^16.4.0",
     "langchain": "^1.0.6",
-    "llpsdk": "^0.2.0",
+    "llpsdk": "file:../../../llpsdk/llp-javascript",
     "pdf-parse": "^2.4.5",
     "pdfjs-dist": "^5.5.207",
     "zod": "^3.25.76"

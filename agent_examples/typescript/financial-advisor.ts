@@ -20,11 +20,12 @@ import {
 	LLPClientConfig,
 	type Annotater,
 } from 'llpsdk';
+import { createLLPToolMiddleware } from 'llpsdk/langchain';
 import { ChatOllama } from '@langchain/ollama';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { WebPDFLoader } from '@langchain/community/document_loaders/web/pdf';
-import { createAgent, createMiddleware, tool } from 'langchain';
+import { createAgent, tool } from 'langchain';
 import * as z from 'zod';
 
 // =============================================================================
@@ -106,30 +107,6 @@ type FinancialAnalysis = z.infer<typeof financialAnalysisSchema>;
 // =============================================================================
 
 const outputParser = new JsonOutputParser<FinancialAnalysis>();
-const middlewareStateSchema = z.object({
-	modelCallCount: z.number().default(0),
-});
-const middlewareContextSchema = z.object({
-	annotater: z.custom<Annotater>(),
-	message: z.custom<TextMessage>(),
-	correlationId: z.string(),
-});
-
-interface MiddlewareRuntimeContext {
-	annotater: Annotater;
-	message: TextMessage;
-	correlationId: string;
-}
-
-interface ToolCallRequest {
-	toolCall: {
-		name: string;
-		args: unknown;
-	};
-	runtime: {
-		context: MiddlewareRuntimeContext;
-	};
-}
 
 async function loadPdfText(url: string): Promise<string> {
 	const response = await fetch(url);
@@ -161,42 +138,7 @@ const loadInvoicePdfTool = tool(
 	},
 );
 
-const llpAnnotationMiddleware = createMiddleware({
-	name: 'LLPToolAnnotationMiddleware',
-	stateSchema: middlewareStateSchema,
-	contextSchema: middlewareContextSchema,
-	afterModel: (state: { modelCallCount: number }) => ({
-		modelCallCount: state.modelCallCount + 1,
-	}),
-	wrapToolCall: async (
-		request: ToolCallRequest,
-		handler: (request: ToolCallRequest) => Promise<unknown>,
-	) => {
-		const startMs = Date.now();
-		const { message, annotater, correlationId } = request.runtime.context;
-		const toolName = request.toolCall.name;
-		const parameters = JSON.stringify(request.toolCall.args);
-		console.log(`[${correlationId}] ... tool=${toolName} args=${parameters}`);
-
-		try {
-			const result = await handler(request);
-			const durationMs = Date.now() - startMs;
-			await annotater.annotateToolCall(
-				message.toolCall(toolName, parameters, JSON.stringify(result), durationMs),
-			);
-			console.log(`[${correlationId}] <<< tool=${toolName} durationMs=${durationMs}`);
-			return result;
-		} catch (error) {
-			const durationMs = Date.now() - startMs;
-			const err = error instanceof Error ? error : new Error(String(error));
-			await annotater.annotateToolCall(
-				message.toolCallException(toolName, parameters, err, durationMs),
-			);
-			console.warn(`[${correlationId}] !!! tool=${toolName} durationMs=${durationMs} error=${err.message}`);
-			throw error;
-		}
-	},
-});
+type AgentMiddleware = ReturnType<typeof createLLPToolMiddleware>;
 
 function extractTextContent(content: unknown): string {
 	if (typeof content === 'string') {
@@ -241,11 +183,14 @@ async function parseAnalysisResponse(rawText: string): Promise<FinancialAnalysis
 	return financialAnalysisSchema.parse(parsed);
 }
 
-export function createFinancialAdvisorAgent(llm: ChatOllama) {
+export function createFinancialAdvisorAgent(
+	llm: ChatOllama,
+	middleware: AgentMiddleware[] = [],
+) {
 	return createAgent({
 		model: llm,
 		tools: [loadInvoicePdfTool],
-		middleware: [llpAnnotationMiddleware],
+		middleware,
 	});
 }
 
@@ -307,7 +252,7 @@ function formatAnalysis(analysis: FinancialAnalysis): string {
 // =============================================================================
 
 export async function handleMessage(
-	agent: ReturnType<typeof createFinancialAdvisorAgent>,
+	llm: ChatOllama,
 	annotater: Annotater,
 	message: TextMessage,
 ): Promise<string> {
@@ -321,20 +266,12 @@ export async function handleMessage(
 
 	let analysis: FinancialAnalysis;
 	try {
+		const agent = createFinancialAdvisorAgent(llm, [createLLPToolMiddleware(message, annotater)]);
+
 		console.log(`[${corrId}] ... calling agent`);
-		const result = await agent.invoke(
-			{
-				messages: [new SystemMessage(SYSTEM_PROMPT), new HumanMessage(fullPrompt)],
-				modelCallCount: 0,
-			},
-			{
-				context: {
-					annotater,
-					message,
-					correlationId: corrId,
-				},
-			},
-		);
+		const result = await agent.invoke({
+			messages: [new SystemMessage(SYSTEM_PROMPT), new HumanMessage(fullPrompt)],
+		});
 		const lastMessage = result.messages[result.messages.length - 1];
 		const rawText = extractTextContent(lastMessage?.content);
 		analysis = await parseAnalysisResponse(rawText);
@@ -374,7 +311,6 @@ async function main(): Promise<void> {
 			? { Authorization: `Bearer ${process.env.OLLAMA_API_KEY}` }
 			: undefined,
 	});
-	const agent = createFinancialAdvisorAgent(llm);
 	console.log(`LangChain ChatOllama initialized model=${model}`);
 
 	// 3. Initialize LLP client
@@ -387,7 +323,7 @@ async function main(): Promise<void> {
 	client.onMessage(async (annotater, msg: TextMessage) => {
 		const corrId = msg.id?.slice(0, 8) ?? 'no-id';
 		console.log(`[${corrId}] --- REQUEST START ---`);
-		const response = await handleMessage(agent, annotater, msg);
+		const response = await handleMessage(llm, annotater, msg);
 		console.log(`[${corrId}] <<< SEND to=${msg.sender} len=${response.length}`);
 		console.log(`[${corrId}] --- REQUEST END ---`);
 		return msg.reply(response);
