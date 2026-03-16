@@ -6,7 +6,7 @@
  */
 
 import { config } from 'dotenv';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { dirname, join } from 'path';
 
 // Load .env from the same directory as this script
@@ -14,16 +14,14 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 config({ path: join(__dirname, '.env') });
 
-import {
-	LLPClient,
-	TextMessage,
-	LLPClientConfig,
-	PlatformTraceHandler,
-} from 'llpsdk';
+import { LLPClient, TextMessage, type LLPClientConfig, type Annotater } from 'llpsdk';
+import { createLLPToolMiddleware } from 'llpsdk/langchain';
 import { ChatOllama } from '@langchain/ollama';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import { HumanMessage } from '@langchain/core/messages';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { WebPDFLoader } from '@langchain/community/document_loaders/web/pdf';
+import { createAgent, tool } from 'langchain';
+import * as z from 'zod';
 
 // =============================================================================
 // Constants
@@ -88,20 +86,106 @@ Return JSON matching ONE of these formats:
 // Types (mirrors Python dataclasses / Go structs)
 // =============================================================================
 
-interface FinancialAnalysis {
-	type: 'analysis' | 'capabilities' | 'decline' | string;
-	category?: 'investment' | 'budgeting' | 'retirement' | 'tax' | 'debt' | 'savings';
-	risk_level?: 'low' | 'medium' | 'high';
-	recommendation?: string;
-	considerations?: string[];
-	reason?: string; // For decline responses
-}
+const financialAnalysisSchema = z.object({
+	type: z.union([z.literal('analysis'), z.literal('capabilities'), z.literal('decline'), z.string()]),
+	category: z.enum(['investment', 'budgeting', 'retirement', 'tax', 'debt', 'savings', 'invoices']).optional(),
+	risk_level: z.enum(['low', 'medium', 'high']).optional(),
+	recommendation: z.string().optional(),
+	considerations: z.array(z.string()).optional(),
+	reason: z.string().optional(),
+});
+
+type FinancialAnalysis = z.infer<typeof financialAnalysisSchema>;
 
 // =============================================================================
 // LangChain setup
 // =============================================================================
 
 const outputParser = new JsonOutputParser<FinancialAnalysis>();
+
+async function loadPdfText(url: string): Promise<string> {
+	const response = await fetch(url);
+	if (!response.ok) {
+		throw new Error(`Attachment fetch failed with status ${response.status}`);
+	}
+
+	const blob = await response.blob();
+	const loader = new WebPDFLoader(blob, {
+		splitPages: false,
+		pdfjs: () => import('pdfjs-dist/legacy/build/pdf.mjs') as never,
+	});
+	const docs = await loader.load();
+	return docs.map(d => d.pageContent).join('\n');
+}
+
+const loadInvoicePdfTool = tool(
+	async ({ url }: { url: string }) => {
+		const content = await loadPdfText(url);
+		return content;
+	},
+	{
+		name: 'load_invoice_pdf',
+		description:
+			'Load and extract text from a PDF invoice attachment when the user asks about invoice contents or an attached PDF.',
+		schema: z.object({
+			url: z.string().url().describe('The attachment URL for the PDF to inspect'),
+		}),
+	},
+);
+
+function extractTextContent(content: unknown): string {
+	if (typeof content === 'string') {
+		return content;
+	}
+
+	if (Array.isArray(content)) {
+		return content
+			.map(item => {
+				if (typeof item === 'string') {
+					return item;
+				}
+				if (item && typeof item === 'object' && 'text' in item) {
+					return String((item as { text?: unknown }).text ?? '');
+				}
+				return '';
+			})
+			.filter(Boolean)
+			.join('\n');
+	}
+
+	return String(content ?? '');
+}
+
+function buildPrompt(message: TextMessage): string {
+	const attachmentUrl = message.attachment;
+	if (!message.hasAttachment() || !attachmentUrl) {
+		return `${message.prompt}
+
+Return ONLY valid JSON matching the required schema.`;
+	}
+
+	return `${message.prompt}
+
+An attachment is available at this URL: ${attachmentUrl}
+If the user is asking about the attachment or an invoice, use the load_invoice_pdf tool with that URL before answering.
+Return ONLY valid JSON matching the required schema.`;
+}
+
+async function parseAnalysisResponse(rawText: string): Promise<FinancialAnalysis> {
+	const parsed = await outputParser.invoke(rawText);
+	return financialAnalysisSchema.parse(parsed);
+}
+
+export function createFinancialAdvisorAgent(llm: ChatOllama) {
+	return createAgent({
+		model: llm,
+		tools: [loadInvoicePdfTool],
+		middleware: [createLLPToolMiddleware()],
+		systemPrompt: SYSTEM_PROMPT,
+	});
+}
+
+export type FinancialAdvisorAgent = ReturnType<typeof createFinancialAdvisorAgent>;
 
 // =============================================================================
 // Helper Functions
@@ -161,76 +245,32 @@ function formatAnalysis(analysis: FinancialAnalysis): string {
 // =============================================================================
 
 export async function handleMessage(
-	llm: ChatOllama,
+	agent: FinancialAdvisorAgent,
 	message: TextMessage,
-	traceHandler?: PlatformTraceHandler,
-	client?: LLPClient,
+	annotater: Annotater,
 ): Promise<string> {
-	// Use message ID as correlation ID for tracing request/response pairs
 	const corrId = message.id?.slice(0, 8) ?? 'no-id';
 	const preview = message.prompt.slice(0, 80);
 	console.log(`[${corrId}] >>> RECV from=${message.sender} prompt="${preview}"`);
-	console.log(message);
 
-	// Fetch PDF attachment via WebPDFLoader
-	let attachmentContent = '';
-	if (message.hasAttachment()) {
-		const start = Date.now();
-		try {
-			console.log(`[${corrId}] ... fetching attachment url=${message.attachment}`);
-			const response = await fetch(message.attachment);
-			if (!response.ok) {
-				console.warn(`[${corrId}] !!! ATTACHMENT FETCH FAILED status=${response.status}`);
-			} else {
-				const blob = await response.blob();
-				const loader = new WebPDFLoader(blob, {
-					splitPages: false,
-					pdfjs: () => import('pdfjs-dist/legacy/build/pdf.mjs') as never,
-				});
-				const docs = await loader.load();
-				attachmentContent = docs.map(d => d.pageContent).join('\n');
-				console.log(`[${corrId}] <<< attachment parsed pages=${docs.length} len=${attachmentContent.length}`);
-			}
-		} catch (err) {
-			console.error(`[${corrId}] !!! ATTACHMENT FETCH ERROR error=${err}`);
-		} finally {
-			if (client?.traceHandler) {
-				await client.sendTrace({
-					prompt: 'attachment_fetched',
-					stepType: 'io',
-					decisionId: corrId,
-					latencyMs: Date.now() - start,
-				});
-			}
-		}
-	}
+	const fullPrompt = buildPrompt(message);
 
-	// Build prompt with attachment content if available
-	const fullPrompt = attachmentContent
-		? `${message.prompt}\n\nAttachment content type: application/pdf\nAttachment content:\n${attachmentContent}`
-		: message.prompt;
-
-	// Call LLM via LangChain chain: messages → ChatOllama → JsonOutputParser
 	let analysis: FinancialAnalysis;
 	try {
-		console.log(`[${corrId}] ... calling LLM`);
-		const chain = llm.withConfig(
-			traceHandler ? { callbacks: [traceHandler] } : {},
-		).pipe(outputParser);
-		analysis = await chain.invoke(
-			[
-				new SystemMessage(SYSTEM_PROMPT),
-				new HumanMessage(fullPrompt),
-			],
-			traceHandler ? { callbacks: [traceHandler] } : {},
+		console.log(`[${corrId}] ... calling agent`);
+		const result = await agent.invoke(
+			{ messages: [new HumanMessage(fullPrompt)] },
+			{ context: { llpMessage: message, llpClient: annotater } },
 		);
+		const lastMessage = result.messages[result.messages.length - 1];
+		const rawText = extractTextContent(lastMessage?.content);
+		analysis = await parseAnalysisResponse(rawText);
 		console.log(`[${corrId}] === type=${analysis.type} category=${analysis.category ?? 'n/a'}`);
 	} catch (err) {
 		console.error(`[${corrId}] !!! LLM CALL FAILED error=${err}`);
 		return "I'm sorry, I encountered an error processing your request.";
 	}
 
-	// Route based on response type
 	if (analysis.type === 'capabilities') {
 		return formatCapabilities();
 	} else if (analysis.type === 'decline') {
@@ -247,11 +287,9 @@ export async function handleMessage(
 // =============================================================================
 
 async function main(): Promise<void> {
-	// 1. Load environment variables
 	const agentName = process.env.AGENT_NAME ?? 'financial-advisor-ts';
-	const apiKey = process.env.AGENT_KEY ?? 'Z22MAsvpGFrMMX9qLZZqIynKp/42gBa4Edl/X94MFkA';
+	const apiKey = process.env.AGENT_KEY ?? '';
 
-	// 2. Initialize LangChain ChatOllama client
 	const model = process.env.OLLAMA_MODEL ?? 'gpt-oss:120b';
 	const llm = new ChatOllama({
 		baseUrl: process.env.OLLAMA_HOST ?? 'http://localhost:11434',
@@ -262,24 +300,21 @@ async function main(): Promise<void> {
 	});
 	console.log(`LangChain ChatOllama initialized model=${model}`);
 
-// 3. Initialize LLP client (with tracing enabled)
-const llpConfig: LLPClientConfig = {
-	url: process.env.PLATFORM_ADDRESS ?? 'ws://localhost:4000/agent/websocket',
-	responseTimeout: 600000, // 10 minutes
-};
-const client = new LLPClient(agentName, apiKey, { ...llpConfig, tracing: true });
-const traceHandler = client.traceHandler;
+	const llpConfig: LLPClientConfig = {
+		url: process.env.PLATFORM_ADDRESS ?? 'ws://localhost:4000/agent/websocket',
+		responseTimeout: 600000,
+	};
 
-	client.onMessage(async (msg: TextMessage) => {
-		const corrId = msg.id?.slice(0, 8) ?? 'no-id';
-		console.log(`[${corrId}] --- REQUEST START ---`);
-		const response = await handleMessage(llm, msg, traceHandler, client);
-		console.log(`[${corrId}] <<< SEND to=${msg.sender} len=${response.length}`);
-		console.log(`[${corrId}] --- REQUEST END ---`);
-		return msg.reply(response);
-	});
+	const client = new LLPClient(agentName, apiKey, llpConfig)
+		.onStart(() => createFinancialAdvisorAgent(llm))
+		.onMessage(async (agent, msg, annotater) => {
+			const response = await handleMessage(agent, msg, annotater);
+			return msg.reply(response);
+		})
+		.onStop(() => {
+			console.log('session ended');
+		});
 
-	// 5. Setup graceful shutdown
 	const shutdown = async () => {
 		console.log('\nShutting down...');
 		await client.close();
@@ -290,12 +325,9 @@ const traceHandler = client.traceHandler;
 	process.on('SIGINT', shutdown);
 	process.on('SIGTERM', shutdown);
 
-	// 6. Connect and run
 	try {
 		await client.connect();
 		console.log('Connected to platform');
-
-		// Wait forever
 		await new Promise(() => {});
 	} catch (err) {
 		console.error('Fatal error:', err);
@@ -303,4 +335,9 @@ const traceHandler = client.traceHandler;
 	}
 }
 
-main();
+const isMainModule =
+	process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMainModule) {
+	void main();
+}
