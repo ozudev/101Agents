@@ -7,5 +7,5 @@
 		"skipLibCheck": true,
 		"esModuleInterop": true
 	},
-	"include": ["financial-advisor.ts"]
+	"include": ["financial-advisor.ts", "test-financial-advisor.ts"]
 }
