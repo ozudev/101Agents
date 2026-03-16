@@ -1,0 +1,21 @@
+{
+  "name": "loan-advisor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx loan-advisor.ts"
+  },
+  "dependencies": {
+    "@mastra/core": "^0.10.0",
+    "dotenv": "^16.4.0",
+    "llpsdk": "file:../../../../llpsdk/llp-javascript",
+    "ollama-ai-provider": "^1.2.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.5.0"
+  }
+}
