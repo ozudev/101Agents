@@ -288,7 +288,7 @@ export async function handleMessage(
 
 async function main(): Promise<void> {
 	const agentName = process.env.AGENT_NAME ?? 'financial-advisor-ts';
-	const apiKey = process.env.AGENT_KEY ?? 'Z22MAsvpGFrMMX9qLZZqIynKp/42gBa4Edl/X94MFkA';
+	const apiKey = process.env.AGENT_KEY ?? '';
 
 	const model = process.env.OLLAMA_MODEL ?? 'gpt-oss:120b';
 	const llm = new ChatOllama({
