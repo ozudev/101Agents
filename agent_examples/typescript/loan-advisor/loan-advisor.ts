@@ -13,12 +13,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 config({ path: join(__dirname, '.env') });
 
-import { Agent } from '@mastra/core';
+import { Agent } from '@mastra/core/agent';
 import { createTool } from '@mastra/core/tools';
-import { RuntimeContext } from '@mastra/core/runtime-context';
+import { RequestContext } from '@mastra/core/request-context';
 import { LLPClient, TextMessage, type LLPClientConfig, type Annotater } from 'llpsdk';
 import { wrapWithLLPAnnotation, type LLPMastraContext } from 'llpsdk/mastra';
-import { createOllama } from 'ollama-ai-provider';
 import * as z from 'zod';
 
 // =============================================================================
@@ -96,7 +95,7 @@ type LoanResponse = z.infer<typeof loanResponseSchema>;
 
 // LLPMastraContext from llpsdk/mastra provides the standard field names:
 //   { llpMessage: TextMessage; llpAnnotater: Annotater }
-// Used as: new RuntimeContext<LLPMastraContext>()
+// Used as: new RequestContext<LLPMastraContext>()
 
 // =============================================================================
 // SearXNG helpers
@@ -155,8 +154,8 @@ const getLoanRatesTool = createTool({
 	}),
 	execute: wrapWithLLPAnnotation<{ loan_type: 'home' | 'auto' | 'student' | 'personal' }, string>(
 		'get_loan_rates',
-		async ({ context }) => {
-			const query = `current ${context.loan_type} loan interest rates today`;
+		async (inputData) => {
+			const query = `current ${inputData.loan_type} loan interest rates today`;
 			return await searchSearXNG(query, process.env.SEARXNG_URL ?? 'http://localhost:8080');
 		},
 	),
@@ -166,10 +165,9 @@ const getLoanRatesTool = createTool({
 // Agent
 // =============================================================================
 
-type OllamaModel = ReturnType<ReturnType<typeof createOllama>>;
-
-export function createLoanAdvisorAgent(model: OllamaModel) {
+export function createLoanAdvisorAgent(model: string) {
 	return new Agent({
+		id: 'loan-advisor',
 		name: 'loan-advisor',
 		instructions: SYSTEM_PROMPT,
 		model,
@@ -264,14 +262,14 @@ export async function handleMessage(
 	const preview = message.prompt.slice(0, 80);
 	console.log(`[${corrId}] >>> RECV from=${message.sender} prompt="${preview}"`);
 
-	const runtimeContext = new RuntimeContext<LLPMastraContext>();
-	runtimeContext.set('llpMessage', message);
-	runtimeContext.set('llpAnnotater', annotater);
+	const requestContext = new RequestContext<LLPMastraContext>();
+	requestContext.set('llpMessage', message);
+	requestContext.set('llpAnnotater', annotater);
 
 	let response: LoanResponse;
 	try {
 		console.log(`[${corrId}] ... calling agent`);
-		const result = await agent.generate(buildPrompt(message), { runtimeContext });
+		const result = await agent.generate(buildPrompt(message), { requestContext });
 		response = parseResponse(result.text);
 		console.log(`[${corrId}] === type=${response.type} category=${response.category ?? 'n/a'}`);
 	} catch (err) {
@@ -298,11 +296,8 @@ async function main(): Promise<void> {
 	const agentName = process.env.AGENT_NAME ?? 'loan-advisor';
 	const apiKey = process.env.AGENT_KEY ?? '';
 
-	const modelName = process.env.MODEL_NAME ?? 'llama3.1';
-	const ollamaHost = process.env.OLLAMA_HOST ?? 'http://localhost:11434';
-	const ollama = createOllama({ baseURL: `${ollamaHost}/api` });
-	const model = ollama(modelName);
-	console.log(`Mastra Agent initialized model=${modelName}`);
+	const model = process.env.MODEL_NAME ?? 'ollama/llama3.1';
+	console.log(`Mastra Agent initialized model=${model}`);
 
 	const llpConfig: LLPClientConfig = {
 		url: process.env.PLATFORM_ADDRESS ?? 'ws://localhost:4000/agent/websocket',

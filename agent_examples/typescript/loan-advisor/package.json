@@ -7,7 +7,7 @@
     "start": "tsx loan-advisor.ts"
   },
   "dependencies": {
-    "@mastra/core": "^0.10.0",
+    "@mastra/core": "^1.15.0",
     "dotenv": "^16.4.0",
     "llpsdk": "file:../../../../llpsdk/llp-javascript",
     "ollama-ai-provider": "^1.2.0",
